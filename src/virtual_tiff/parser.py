@@ -144,7 +144,12 @@ def _get_attributes(ifd: ImageFileDirectory) -> dict[str, Any]:
         attrs = _parse_geo_key_directory(ifd.geo_key_directory)
     else:
         attrs = {}
-    extra_keys = ["model_pixel_scale", "model_tiepoint", "photometric_interpretation"]
+    extra_keys = [
+        "model_pixel_scale",
+        "model_tiepoint",
+        "model_transformation",
+        "photometric_interpretation",
+    ]
     for key in extra_keys:
         if value := getattr(ifd, key):
             attrs[key] = value

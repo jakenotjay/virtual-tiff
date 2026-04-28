@@ -424,7 +424,7 @@ def _construct_manifest_array(
     return ManifestArray(metadata=metadata, chunkmanifest=chunk_manifest)
 
 
-def _construct_manifest_group(
+async def _aconstruct_manifest_group(
     url: str,
     store: ObjectStore,
     path: str,
@@ -433,6 +433,9 @@ def _construct_manifest_group(
     ifd_layout: Literal["flat", "nested"] = "flat",
 ) -> ManifestGroup:
     """Construct a ManifestGroup from TIFF IFDs.
+
+    Awaits the TIFF open on the caller's event loop so that concurrent
+    callers do not serialise on zarr's shared ``zarr_io`` thread.
 
     Args:
         store: Object store for reading the TIFF
@@ -443,14 +446,11 @@ def _construct_manifest_group(
     Returns:
         ManifestGroup containing the processed TIFF data
     """
-    # TODO: Make an async approach
-    tiff = sync(_open_tiff(store=store, path=path))
+    tiff = await _open_tiff(store=store, path=path)
     endian = _ENDIANNESS_TO_STR[tiff.endianness]
 
-    # Build manifest arrays from selected IFDs
     manifest_arrays = _build_manifest_arrays(tiff, url, endian, ifd)
 
-    # Organize into appropriate group structure
     attrs: dict[str, Any] = {}
     if ifd_layout == "flat":
         return _create_flat_group(manifest_arrays, attrs)
@@ -542,8 +542,14 @@ class VirtualTIFF:
         self._ifd = ifd
         self.ifd_layout = ifd_layout
 
-    def __call__(self, url: str, registry: ObjectStoreRegistry) -> ManifestStore:
-        """Produce a ManifestStore from a file path and object store instance.
+    async def aopen(
+        self, url: str, registry: ObjectStoreRegistry
+    ) -> ManifestStore:
+        """Async equivalent of :meth:`__call__`.
+
+        Awaits the TIFF open on the caller's event loop, allowing concurrent
+        parses (e.g. via :func:`asyncio.gather`) to run truly in parallel
+        rather than serialising on zarr's shared ``zarr_io`` thread.
 
         Args:
             url : URL to the TIFF.
@@ -554,13 +560,25 @@ class VirtualTIFF:
         """
         store, path_in_store = registry.resolve(url)
         async_tiff_store = convert_obstore_to_async_tiff_store(store)
-        # Create a group containing dataset level metadata and all the manifest arrays
-        manifest_group = _construct_manifest_group(
+        manifest_group = await _aconstruct_manifest_group(
             url,
             store=async_tiff_store,
             path=path_in_store,
             ifd=self._ifd,
             ifd_layout=self.ifd_layout,
         )
-        # Convert to a manifest store
         return ManifestStore(registry=registry, group=manifest_group)
+
+    def __call__(self, url: str, registry: ObjectStoreRegistry) -> ManifestStore:
+        """Produce a ManifestStore from a file path and object store instance.
+
+        Args:
+            url : URL to the TIFF.
+            registry : ObjectStoreRegistry to use for reading the TIFF.
+
+        Returns:
+            ms : ManifestStore containing ChunkManifests and Array metadata for the specified IFDs, along with an ObjectStore instance for loading any data.
+        """
+        # Route through aopen so the sync and async paths share one
+        # implementation; sync() dispatches to zarr's shared io loop.
+        return sync(self.aopen(url, registry))

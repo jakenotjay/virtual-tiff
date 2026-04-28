@@ -432,10 +432,19 @@ async def _aconstruct_manifest_group(
     ifd: int | None = None,
     ifd_layout: Literal["flat", "nested"] = "flat",
 ) -> ManifestGroup:
-    """Async version of :func:`_construct_manifest_group`.
+    """Construct a ManifestGroup from TIFF IFDs.
 
     Awaits the TIFF open on the caller's event loop so that concurrent
     callers do not serialise on zarr's shared ``zarr_io`` thread.
+
+    Args:
+        store: Object store for reading the TIFF
+        path: Full URL path to the TIFF file
+        ifd: Specific IFD index to process, or None for all IFDs
+        ifd_layout: How to organize IFDs - 'flat' for single group, 'nested' for group per IFD
+
+    Returns:
+        ManifestGroup containing the processed TIFF data
     """
     tiff = await _open_tiff(store=store, path=path)
     endian = _ENDIANNESS_TO_STR[tiff.endianness]
@@ -451,32 +460,6 @@ async def _aconstruct_manifest_group(
         raise ValueError(
             f"Expected 'flat' or 'nested' for ifd_layout; got {ifd_layout}"
         )
-
-
-def _construct_manifest_group(
-    url: str,
-    store: ObjectStore,
-    path: str,
-    *,
-    ifd: int | None = None,
-    ifd_layout: Literal["flat", "nested"] = "flat",
-) -> ManifestGroup:
-    """Construct a ManifestGroup from TIFF IFDs.
-
-    Args:
-        store: Object store for reading the TIFF
-        path: Full URL path to the TIFF file
-        ifd: Specific IFD index to process, or None for all IFDs
-        ifd_layout: How to organize IFDs - 'flat' for single group, 'nested' for group per IFD
-
-    Returns:
-        ManifestGroup containing the processed TIFF data
-    """
-    return sync(
-        _aconstruct_manifest_group(
-            url, store, path, ifd=ifd, ifd_layout=ifd_layout
-        )
-    )
 
 
 def _build_manifest_arrays(

@@ -4,6 +4,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
+import imagecodecs
 import numpy as np
 import pytest
 from zarr.codecs.bytes import Endian
@@ -572,3 +573,138 @@ class TestHorizontalDeltaFloat:
         spec = _make_spec((1, 3), UInt16())
         result = await codec._decode_single(nd_buf, spec)
         np.testing.assert_array_equal(result.as_ndarray_like(), original)
+
+
+# --- LZW streams missing the End-Of-Information code ---
+
+_LZW_CLEAR_CODE = 256
+_LZW_EOI_CODE = 257
+
+
+def _lzw_encode_literals(
+    data: bytes, *, with_eoi: bool = True, trailing: bytes = b""
+) -> bytes:
+    """Encode ``data`` as a TIFF-LZW stream built only from 9-bit literal codes.
+
+    Each byte is emitted as its own literal code, with a ClearCode every 200
+    codes so the decoder's dictionary never reaches 511 entries and the code
+    width therefore stays at 9 bits for the whole stream. That keeps this helper
+    clear of the TIFF "early change" code-width subtleties while still producing
+    a stream that any conformant LZW decoder accepts.
+
+    Parameters
+    ----------
+    with_eoi
+        Whether to terminate the stream with the mandatory EOI code. TIFF 6.0
+        requires it, but writers in the wild sometimes omit it.
+    trailing
+        Extra bytes appended after the code stream, as emitted by writers that
+        pad tile data. Together with a missing EOI these leave enough bits for
+        the decoder's size pre-scan to read a phantom code.
+    """
+    out = bytearray()
+    acc = nbits = 0
+
+    def write(code: int) -> None:
+        nonlocal acc, nbits
+        acc = (acc << 9) | code
+        nbits += 9
+        while nbits >= 8:
+            nbits -= 8
+            out.append((acc >> nbits) & 0xFF)
+        acc &= (1 << nbits) - 1
+
+    write(_LZW_CLEAR_CODE)
+    since_clear = 0
+    for byte in data:
+        if since_clear >= 200:
+            write(_LZW_CLEAR_CODE)
+            since_clear = 0
+        write(byte)
+        since_clear += 1
+    if with_eoi:
+        write(_LZW_EOI_CODE)
+    if nbits:  # pad the final byte with zero bits
+        out.append((acc << (8 - nbits)) & 0xFF)
+    return bytes(out) + trailing
+
+
+class TestLZWWithoutEOI:
+    """TIFF 6.0 requires every LZW strip/tile to end with an End-Of-Information
+    code, but some writers omit it (e.g. GLAD's annual class maps).
+
+    ``imagecodecs.lzw_decode`` can only learn the decoded size by walking the
+    code stream first (``imcd_lzw_decode_size``), and with no EOI to stop at
+    that walk continues into the stream's trailing padding: it either decodes
+    phantom codes into extra bytes, or hits an undecodable code and raises. The
+    pixels themselves are fine -- decoding into a correctly sized buffer skips
+    the size pre-scan entirely, which is what tifffile has always done.
+    """
+
+    SHAPE = (256, 256)
+    NBYTES = 256 * 256
+
+    @staticmethod
+    def _payload(nbytes: int) -> bytes:
+        return ((np.arange(nbytes) * 7 + 13) % 256).astype(np.uint8).tobytes()
+
+    @staticmethod
+    async def _decode(raw: bytes, spec: ArraySpec) -> bytes:
+        buf = default_buffer_prototype().buffer.from_bytes(raw)
+        decoded = await LZWCodec()._decode_single(buf, spec)
+        return decoded.to_bytes()
+
+    @pytest.mark.asyncio
+    async def test_missing_eoi_over_emitting_stream(self):
+        """Zero padding past the last code decodes as phantom bytes, so the
+        unsized decode over-emits. Downstream this surfaces from zarr's
+        BytesCodec as 'cannot reshape array of size 65538 into shape (256, 256)'.
+        """
+        original = self._payload(self.NBYTES)
+        raw = _lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
+        # Precondition: without the expected size, imagecodecs over-emits.
+        assert len(imagecodecs.lzw_decode(raw)) > self.NBYTES
+
+        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
+
+    @pytest.mark.asyncio
+    async def test_missing_eoi_corrupt_prescan_stream(self):
+        """Set padding bits past the last code form an out-of-range code, so the
+        size pre-scan raises ImcdError IMCD_LZW_CORRUPT before any output buffer
+        exists -- which is why truncating after decoding cannot fix these tiles.
+        """
+        original = self._payload(self.NBYTES)
+        raw = _lzw_encode_literals(original, with_eoi=False, trailing=b"\xff\xff")
+        # Precondition: without the expected size, imagecodecs raises.
+        with pytest.raises(imagecodecs.LzwError, match="IMCD_LZW_CORRUPT"):
+            imagecodecs.lzw_decode(raw)
+
+        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
+
+    @pytest.mark.asyncio
+    async def test_conformant_stream_still_decodes(self):
+        """A stream that does end with EOI must decode exactly as before."""
+        original = self._payload(self.NBYTES)
+        raw = _lzw_encode_literals(original, with_eoi=True)
+        assert imagecodecs.lzw_decode(raw) == original  # unaffected by the fix
+
+        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
+
+    @pytest.mark.asyncio
+    async def test_missing_eoi_multibyte_dtype(self):
+        """The expected size must account for the dtype's item size, not just
+        the number of elements."""
+        original = self._payload(2 * self.NBYTES)
+        raw = _lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
+
+        assert await self._decode(raw, _make_spec(self.SHAPE, UInt16())) == original
+
+    @pytest.mark.asyncio
+    async def test_truncated_stream_raises(self):
+        """A stream that genuinely decodes to fewer bytes than the chunk needs is
+        real corruption. It must raise rather than return a partly filled buffer,
+        because the decoder leaves the untouched tail of the output buffer
+        uninitialised."""
+        raw = _lzw_encode_literals(self._payload(1000), with_eoi=True)
+        with pytest.raises(ValueError, match="1000 bytes.*expected 65536"):
+            await self._decode(raw, _make_spec(self.SHAPE, UInt8()))

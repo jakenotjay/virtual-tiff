@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import (
@@ -204,6 +205,43 @@ class LercCodec(_ImageCodecsBytesBytesCodec):
 
 class LZWCodec(_ImageCodecsBytesBytesCodec):
     codec_name = "imagecodecs_lzw"
+
+    def _decode_sized(
+        self, chunk_bytes: Buffer, prototype: BufferPrototype, nbytes: int
+    ) -> Buffer:
+        out = np.empty(nbytes, dtype=np.uint8)
+        # imagecodecs returns a view of only the bytes it actually wrote, so the
+        # return value has to be used rather than the buffer itself.
+        decoded = memoryview(
+            self._codec.decode(chunk_bytes.as_numpy_array(), out=out)
+        ).cast("B")
+        if len(decoded) != nbytes:
+            raise ValueError(
+                f"{self.codec_name} decoded {len(decoded)} bytes, expected "
+                f"{nbytes}: the compressed stream is truncated or corrupt"
+            )
+        return prototype.buffer.from_bytes(decoded)
+
+    async def _decode_single(
+        self, chunk_bytes: Buffer, chunk_spec: ArraySpec
+    ) -> Buffer:
+        """Decode into a pre-sized buffer rather than letting imagecodecs infer
+        the decoded size.
+
+        TIFF requires every LZW strip or tile to end with an End-Of-Information
+        code, but some writers omit it. With no EOI to stop at, the size
+        pre-scan (``imcd_lzw_decode_size``) that imagecodecs runs when it is not
+        told the output size keeps walking into the stream's trailing padding
+        and decodes it as extra codes, so it either over-estimates the size or
+        raises ``IMCD_LZW_CORRUPT``. Supplying the size skips that pre-scan
+        entirely, which is what tifffile has always done.
+        """
+        nbytes = (
+            math.prod(chunk_spec.shape) * chunk_spec.dtype.to_native_dtype().itemsize
+        )
+        return await asyncio.to_thread(
+            self._decode_sized, chunk_bytes, chunk_spec.prototype, nbytes
+        )
 
 
 class PackBitsCodec(_ImageCodecsBytesBytesCodec):

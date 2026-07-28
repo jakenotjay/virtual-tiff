@@ -172,7 +172,7 @@ def test_lzw_tile_without_eoi(
     rng = np.random.default_rng(0)
     shape = (64, 96) if samples_per_pixel == 1 else (64, 96, samples_per_pixel)
     pixels = rng.integers(0, 256, size=shape, dtype=np.uint8)
-    filepath = write_lzw_tiff(
+    written = write_lzw_tiff(
         tmp_path / "no_eoi.tif",
         pixels,
         tile=LZW_TILE,  # tiles smaller than the image, so chunks != shape
@@ -181,29 +181,18 @@ def test_lzw_tile_without_eoi(
         trailing=trailing,
     )
 
-    # Whether the pad bytes actually defeat the size pre-scan depends on each
-    # block's byte count, so pin it for every block the file was built from rather
-    # than assume the geometry above still provokes the failure.
-    tile_height, tile_width = LZW_TILE
-    bands = np.atleast_3d(pixels)
-    for band in (
-        [bands]
-        if planar_configuration == 1
-        else np.split(bands, samples_per_pixel, axis=2)
-    ):
-        for y in range(0, bands.shape[0], tile_height):
-            for x in range(0, bands.shape[1], tile_width):
-                payload = np.ascontiguousarray(
-                    band[y : y + tile_height, x : x + tile_width]
-                ).tobytes()
-                assert lzw_prescan_outcome(payload, trailing) == prescan_outcome
+    # Whether the pad bytes actually defeat the size pre-scan depends on where the
+    # last code of each stream lands, so pin it for the streams the file really
+    # contains rather than assume the geometry above still provokes the failure.
+    for stream, nbytes in written.blocks:
+        assert lzw_prescan_outcome(stream, nbytes) == prescan_outcome
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
-    ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
+    ds = loadable_dataset(f"file://{written.path}", registry, mask_and_scale=False)
     assert ds["0"].encoding["chunks"] == expected_chunks
     actual = ds["0"].data
 
-    expected = rioxarray.open_rasterio(filepath, masked=False).data
+    expected = rioxarray.open_rasterio(written.path, masked=False).data
     np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
     # ...and the pixels written in the first place, so a decoder that agreed
     # with GDAL on the wrong answer would still be caught
@@ -217,10 +206,12 @@ def test_lzw_tile_without_eoi(
         (16, (16, 96), b"\x00\x00", "over-emit"),
         (16, (16, 96), b"\xff\xff", "corrupt"),
         (1000, (64, 96), b"\x00\x00", "over-emit"),
-        # A single full-height strip runs long enough that the 0xff padding forms a
-        # code the dictionary already holds, so this case over-emits instead of
-        # raising. Which mode a stream lands in follows from its byte count, hence
-        # spelling out the expectation per case rather than per pad byte.
+        # This one over-emits rather than raising because of where its last code
+        # lands, not because it is longer: the phantom code the 0xff padding forms is
+        # 2**(9 - p) - 1 for p zero pad bits, and only p == 1 gives a literal (255)
+        # that the dictionary holds while leaving too few bits behind for another
+        # code. Every other alignment reads 511, which this encoder's dictionary
+        # never reaches. Hence an expectation per case rather than per pad byte.
         (1000, (64, 96), b"\xff\xff", "over-emit"),
     ],
     ids=[
@@ -243,7 +234,7 @@ def test_lzw_strip_without_eoi(
     """
     rng = np.random.default_rng(0)
     pixels = rng.integers(0, 256, size=(64, 96), dtype=np.uint8)
-    filepath = write_lzw_tiff(
+    written = write_lzw_tiff(
         tmp_path / "no_eoi_strips.tif",
         pixels,
         rows_per_strip=rows_per_strip,
@@ -251,16 +242,15 @@ def test_lzw_strip_without_eoi(
         trailing=trailing,
     )
 
-    for y in range(0, pixels.shape[0], expected_chunks[0]):
-        strip = pixels[y : y + expected_chunks[0], :]
-        assert lzw_prescan_outcome(strip.tobytes(), trailing) == prescan_outcome
+    for stream, nbytes in written.blocks:
+        assert lzw_prescan_outcome(stream, nbytes) == prescan_outcome
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
-    ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
+    ds = loadable_dataset(f"file://{written.path}", registry, mask_and_scale=False)
     assert ds["0"].encoding["chunks"] == expected_chunks
     actual = ds["0"].data
 
-    expected = rioxarray.open_rasterio(filepath, masked=False).data
+    expected = rioxarray.open_rasterio(written.path, masked=False).data
     np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
     np.testing.assert_array_equal(actual.squeeze(), pixels)
 

@@ -1,5 +1,6 @@
 import struct
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 import imagecodecs
@@ -67,26 +68,37 @@ def lzw_encode_literals(
     return bytes(out) + trailing
 
 
-def lzw_prescan_outcome(payload: bytes, trailing: bytes) -> str:
-    """What imagecodecs' size pre-scan does with an EOI-less encoding of ``payload``.
+def lzw_prescan_outcome(stream: bytes, expected_nbytes: int) -> str:
+    """What imagecodecs' size pre-scan does with ``stream`` when not told the size.
 
     Returns ``"over-emit"`` when the pre-scan over-estimates the decoded size,
     ``"corrupt"`` when it walks into an undecodable code, ``"error"`` for any other
     imcd failure, and ``"clean"`` when the pathology does not reproduce at all --
-    which it does not for every combination of payload length and pad bytes, since
+    which it does not for every combination of stream length and pad bytes, since
     whether the padding forms a readable code depends on where the last real code
-    landed and how large the dictionary was by then. Tests that mean to exercise a
-    particular failure mode should assert on this rather than assume it.
+    landed. Tests that mean to exercise a particular failure mode should assert on
+    this rather than assume it.
     """
-    raw = lzw_encode_literals(payload, with_eoi=False, trailing=trailing)
     try:
-        decoded = imagecodecs.lzw_decode(raw)
+        decoded = imagecodecs.lzw_decode(stream)
     except imagecodecs.LzwError as exc:
         return "corrupt" if "IMCD_LZW_CORRUPT" in str(exc) else "error"
-    return "over-emit" if len(decoded) > len(payload) else "clean"
+    return "over-emit" if len(decoded) > expected_nbytes else "clean"
 
 
 _TIFF_SHORT, _TIFF_LONG = 3, 4
+
+
+class LZWTiff(NamedTuple):
+    """A TIFF written by :func:`write_lzw_tiff`.
+
+    ``blocks`` carries every compressed stream the file contains, in file order,
+    paired with the number of bytes it decodes to -- so a test can assert on the
+    exact bytes that were written rather than re-deriving the block geometry.
+    """
+
+    path: str
+    blocks: tuple[tuple[bytes, int], ...]
 
 
 def write_lzw_tiff(
@@ -98,13 +110,14 @@ def write_lzw_tiff(
     planar_configuration: int = 1,
     with_eoi: bool = True,
     trailing: bytes = b"",
-) -> str:
+) -> LZWTiff:
     """Write ``pixels`` as an LZW-compressed TIFF, either tiled or striped.
 
     ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
-    array. Blocks must divide the image evenly in either layout, since no block may
-    be partial -- which matches the reader, whose default chunk grid rejects a
-    partial final strip. Pass at most one of:
+    array. Blocks must divide the image evenly in either layout, so that none is
+    partial: the reader rejects a partial final strip outright, and for tiles this
+    helper simply declines to write the padding a partial tile would need. Pass at
+    most one of:
 
     ``tile``
         the ``(height, width)`` of each tile, defaulting to the whole image. TIFF
@@ -157,17 +170,15 @@ def write_lzw_tiff(
     planes = (
         [pixels] if planar_configuration == 1 else np.split(pixels, samples, axis=2)
     )
-    blocks = [
-        lzw_encode_literals(
-            np.ascontiguousarray(
-                plane[y : y + block_height, x : x + block_width]
-            ).tobytes(),
-            with_eoi=with_eoi,
-            trailing=trailing,
-        )
+    payloads = [
+        np.ascontiguousarray(plane[y : y + block_height, x : x + block_width]).tobytes()
         for plane in planes
         for y in range(0, height, block_height)
         for x in range(0, width, block_width)
+    ]
+    blocks = [
+        lzw_encode_literals(payload, with_eoi=with_eoi, trailing=trailing)
+        for payload in payloads
     ]
     byte_counts = [len(data) for data in blocks]
 
@@ -254,7 +265,10 @@ def write_lzw_tiff(
 
     path = Path(path)
     path.write_bytes(bytes(out))
-    return str(path)
+    return LZWTiff(
+        path=str(path),
+        blocks=tuple(zip(blocks, (len(payload) for payload in payloads), strict=True)),
+    )
 
 
 # Pytest configuration

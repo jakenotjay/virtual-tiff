@@ -11,6 +11,7 @@ from .conftest import (
     geotiff_test_data_examples,
     github_examples,
     loadable_dataset,
+    lzw_prescan_outcome,
     resolve_folder,
     write_lzw_tiff,
 )
@@ -128,9 +129,14 @@ def test_geo_key_attributes_are_not_booleans():
     assert attrs["model_pixel_scale"] == [1.0, 1.0, 0.0]
 
 
-@pytest.mark.parametrize(
-    "trailing", [b"\x00\x00", b"\xff\xff"], ids=["over-emit", "corrupt-prescan"]
+TRAILING_MODES = pytest.mark.parametrize(
+    "trailing,prescan_outcome",
+    [(b"\x00\x00", "over-emit"), (b"\xff\xff", "corrupt")],
+    ids=["over-emit", "corrupt-prescan"],
 )
+
+
+@TRAILING_MODES
 @pytest.mark.parametrize(
     "samples_per_pixel,planar_configuration,expected_chunks",
     [
@@ -141,7 +147,12 @@ def test_geo_key_attributes_are_not_booleans():
     ids=["single", "chunky", "planar"],
 )
 def test_lzw_tile_without_eoi(
-    tmp_path, samples_per_pixel, planar_configuration, expected_chunks, trailing
+    tmp_path,
+    samples_per_pixel,
+    planar_configuration,
+    expected_chunks,
+    trailing,
+    prescan_outcome,
 ):
     """Tiles whose LZW streams omit the mandatory End-Of-Information code read
     correctly end to end, and match what GDAL reads from the same file.
@@ -170,6 +181,14 @@ def test_lzw_tile_without_eoi(
         trailing=trailing,
     )
 
+    # Whether the pad bytes actually defeat the size pre-scan depends on the block
+    # size, so pin it here: without this the geometry could change and quietly
+    # leave the file readable, with the test still passing and covering nothing.
+    block = pixels[:16, :32] if planar_configuration == 1 else pixels[:16, :32, :1]
+    assert lzw_prescan_outcome(np.ascontiguousarray(block).tobytes(), trailing) == (
+        prescan_outcome
+    )
+
     registry = ObjectStoreRegistry({"file://": LocalStore()})
     ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
     assert ds["0"].encoding["chunks"] == expected_chunks
@@ -181,6 +200,52 @@ def test_lzw_tile_without_eoi(
     # with GDAL on the wrong answer would still be caught
     written = pixels if pixels.ndim == 2 else np.moveaxis(pixels, -1, 0)
     np.testing.assert_array_equal(actual.squeeze(), written.squeeze())
+
+
+@pytest.mark.parametrize(
+    "trailing", [b"\x00\x00", b"\xff\xff"], ids=["zero-pad", "ff-pad"]
+)
+@pytest.mark.parametrize(
+    "rows_per_strip,expected_chunks",
+    [(16, (16, 96)), (1000, (64, 96))],
+    ids=["strips", "rows-per-strip-over-height"],
+)
+def test_lzw_strip_without_eoi(tmp_path, rows_per_strip, expected_chunks, trailing):
+    """The same read for striped files, whose chunk shape comes from RowsPerStrip
+    rather than the tile tags.
+
+    Striped LZW is what older, hand-rolled writers emit, which are the writers that
+    omit the EOI code in the first place. The second case has RowsPerStrip larger
+    than the image, where a reader has to clamp it to the height to get the chunk
+    shape the decode is then sized from.
+
+    Unlike the tiled test this only pins that each stream defeats the size pre-scan,
+    not which way: whether the pad bytes read as a valid phantom code or an
+    out-of-range one falls out of the strip's byte count, and at these sizes both
+    pad bytes happen to over-emit. Both failure modes are covered explicitly by the
+    tiled test.
+    """
+    rng = np.random.default_rng(0)
+    pixels = rng.integers(0, 256, size=(64, 96), dtype=np.uint8)
+    filepath = write_lzw_tiff(
+        tmp_path / "no_eoi_strips.tif",
+        pixels,
+        rows_per_strip=rows_per_strip,
+        with_eoi=False,
+        trailing=trailing,
+    )
+
+    strip = pixels[: expected_chunks[0], :]
+    assert lzw_prescan_outcome(strip.tobytes(), trailing) in {"over-emit", "corrupt"}
+
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
+    assert ds["0"].encoding["chunks"] == expected_chunks
+    actual = ds["0"].data
+
+    expected = rioxarray.open_rasterio(filepath, masked=False).data
+    np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
+    np.testing.assert_array_equal(actual.squeeze(), pixels)
 
 
 def test_local_store_with_prefix():

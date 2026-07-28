@@ -2,6 +2,7 @@ import struct
 from pathlib import Path
 from urllib.parse import urlparse
 
+import imagecodecs
 import numpy as np
 import pytest
 import rioxarray
@@ -66,6 +67,25 @@ def lzw_encode_literals(
     return bytes(out) + trailing
 
 
+def lzw_prescan_outcome(payload: bytes, trailing: bytes) -> str:
+    """What imagecodecs' size pre-scan does with an EOI-less encoding of ``payload``.
+
+    Returns ``"over-emit"`` when the pre-scan over-estimates the decoded size,
+    ``"corrupt"`` when it walks into an undecodable code, ``"error"`` for any other
+    imcd failure, and ``"clean"`` when the pathology does not reproduce at all --
+    which it does not for every combination of payload length and pad bytes, since
+    whether the padding forms a readable code depends on where the last real code
+    landed and how large the dictionary was by then. Tests that mean to exercise a
+    particular failure mode should assert on this rather than assume it.
+    """
+    raw = lzw_encode_literals(payload, with_eoi=False, trailing=trailing)
+    try:
+        decoded = imagecodecs.lzw_decode(raw)
+    except imagecodecs.LzwError as exc:
+        return "corrupt" if "IMCD_LZW_CORRUPT" in str(exc) else "error"
+    return "over-emit" if len(decoded) > len(payload) else "clean"
+
+
 _TIFF_SHORT, _TIFF_LONG = 3, 4
 
 
@@ -74,81 +94,107 @@ def write_lzw_tiff(
     pixels: np.ndarray,
     *,
     tile: tuple[int, int] | None = None,
+    rows_per_strip: int | None = None,
     planar_configuration: int = 1,
     with_eoi: bool = True,
     trailing: bytes = b"",
 ) -> str:
-    """Write ``pixels`` as an LZW-compressed, tiled TIFF.
+    """Write ``pixels`` as an LZW-compressed TIFF, either tiled or striped.
 
     ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
-    array. ``tile`` is the ``(height, width)`` of each tile, defaulting to the
-    whole image; TIFF requires both to be multiples of 16, and this helper also
-    requires them to divide the image evenly so that no tile is partial.
+    array. Pass at most one of:
 
-    ``planar_configuration`` is 1 for chunky tiles, where each tile interleaves
-    every sample, or 2 for planar tiles, where each tile holds one sample and the
-    tiles are ordered plane by plane.
+    ``tile``
+        the ``(height, width)`` of each tile, defaulting to the whole image. TIFF
+        requires both to be multiples of 16, and this helper also requires them to
+        divide the image evenly so that no block is partial.
+    ``rows_per_strip``
+        write strips of this many full-width rows instead of tiles. Values larger
+        than the image height are written to the tag as given but produce a single
+        strip covering every row, which is the case readers have to clamp.
+
+    ``planar_configuration`` is 1 for chunky blocks, where each block interleaves
+    every sample, or 2 for planar blocks, where each block holds one sample and the
+    blocks are ordered plane by plane.
 
     ``with_eoi`` and ``trailing`` are passed through to
-    :func:`lzw_encode_literals` for every tile, which is how a file with
-    non-conformant tile streams gets built.
+    :func:`lzw_encode_literals` for every block, which is how a file with
+    non-conformant streams gets built.
     """
     pixels = np.ascontiguousarray(pixels, dtype=np.uint8)
     if pixels.ndim == 2:
         pixels = pixels[:, :, None]
     height, width, samples = pixels.shape
-    tile_height, tile_width = tile or (height, width)
-    if tile_height % 16 or tile_width % 16:
-        raise ValueError(
-            f"TIFF tile dimensions must be multiples of 16, got "
-            f"{(tile_height, tile_width)}"
-        )
-    if height % tile_height or width % tile_width:
-        raise ValueError(
-            f"image {(height, width)} is not an exact number of "
-            f"{(tile_height, tile_width)} tiles"
-        )
-
+    if tile is not None and rows_per_strip is not None:
+        raise ValueError("pass either tile or rows_per_strip, not both")
     if planar_configuration not in (1, 2):
         raise ValueError(
             f"PlanarConfiguration must be 1 or 2, got {planar_configuration}"
         )
 
-    # Chunky files hold one tile per grid position, each interleaving all samples;
-    # planar files hold one tile per sample per grid position, ordered by sample.
+    if rows_per_strip is not None:
+        block_height, block_width = min(rows_per_strip, height), width
+    else:
+        block_height, block_width = tile or (height, width)
+        if block_height % 16 or block_width % 16:
+            raise ValueError(
+                f"TIFF tile dimensions must be multiples of 16, got "
+                f"{(block_height, block_width)}"
+            )
+    if height % block_height or width % block_width:
+        raise ValueError(
+            f"image {(height, width)} is not an exact number of "
+            f"{(block_height, block_width)} blocks"
+        )
+
+    # Chunky files hold one block per grid position, each interleaving all samples;
+    # planar files hold one block per sample per grid position, ordered by sample.
     planes = (
         [pixels] if planar_configuration == 1 else np.split(pixels, samples, axis=2)
     )
-    tiles = [
+    blocks = [
         lzw_encode_literals(
             np.ascontiguousarray(
-                plane[y : y + tile_height, x : x + tile_width]
+                plane[y : y + block_height, x : x + block_width]
             ).tobytes(),
             with_eoi=with_eoi,
             trailing=trailing,
         )
         for plane in planes
-        for y in range(0, height, tile_height)
-        for x in range(0, width, tile_width)
+        for y in range(0, height, block_height)
+        for x in range(0, width, block_width)
     ]
-    byte_counts = [len(data) for data in tiles]
+    byte_counts = [len(data) for data in blocks]
 
-    # Tags must appear in ascending order.
-    entries = [
-        (256, _TIFF_LONG, [width]),  # ImageWidth
-        (257, _TIFF_LONG, [height]),  # ImageLength
-        (258, _TIFF_SHORT, [8] * samples),  # BitsPerSample
-        (259, _TIFF_SHORT, [5]),  # Compression: LZW
-        (262, _TIFF_SHORT, [2 if samples >= 3 else 1]),  # RGB / BlackIsZero
-        (277, _TIFF_SHORT, [samples]),  # SamplesPerPixel
-        (284, _TIFF_SHORT, [planar_configuration]),  # PlanarConfiguration
-        (317, _TIFF_SHORT, [1]),  # Predictor: none
-        (322, _TIFF_LONG, [tile_width]),  # TileWidth
-        (323, _TIFF_LONG, [tile_height]),  # TileLength
-        (324, _TIFF_LONG, [0] * len(tiles)),  # TileOffsets, resolved below
-        (325, _TIFF_LONG, byte_counts),  # TileByteCounts
-        (339, _TIFF_SHORT, [1] * samples),  # SampleFormat: unsigned integer
-    ]
+    if rows_per_strip is not None:
+        offsets_tag = 273  # StripOffsets
+        layout = [
+            (278, _TIFF_LONG, [rows_per_strip]),  # RowsPerStrip
+            (279, _TIFF_LONG, byte_counts),  # StripByteCounts
+        ]
+    else:
+        offsets_tag = 324  # TileOffsets
+        layout = [
+            (322, _TIFF_LONG, [block_width]),  # TileWidth
+            (323, _TIFF_LONG, [block_height]),  # TileLength
+            (325, _TIFF_LONG, byte_counts),  # TileByteCounts
+        ]
+
+    entries = sorted(  # a TIFF IFD's entries must be in ascending tag order
+        [
+            (256, _TIFF_LONG, [width]),  # ImageWidth
+            (257, _TIFF_LONG, [height]),  # ImageLength
+            (258, _TIFF_SHORT, [8] * samples),  # BitsPerSample
+            (259, _TIFF_SHORT, [5]),  # Compression: LZW
+            (262, _TIFF_SHORT, [2 if samples >= 3 else 1]),  # RGB / BlackIsZero
+            (277, _TIFF_SHORT, [samples]),  # SamplesPerPixel
+            (284, _TIFF_SHORT, [planar_configuration]),  # PlanarConfiguration
+            (317, _TIFF_SHORT, [1]),  # Predictor: none
+            (offsets_tag, _TIFF_LONG, [0] * len(blocks)),  # resolved below
+            (339, _TIFF_SHORT, [1] * samples),  # SampleFormat: unsigned integer
+            *layout,
+        ]
+    )
 
     def pack(typ: int, values: list[int]) -> bytes:
         return struct.pack(
@@ -159,25 +205,25 @@ def write_lzw_tiff(
     data_offset = ifd_offset + 2 + 12 * len(entries) + 4
 
     # Values wider than an entry's 4-byte value field live after the IFD, and have
-    # to be laid out before the tile data because the tile offsets depend on where
-    # that starts. Both value types written here are even width, so blocks stay
-    # word aligned without padding. Block sizes depend only on each entry's type
-    # and count, so the layout is identical in both passes.
-    blocks: dict[int, int] = {}
+    # to be laid out before the pixel data because the block offsets depend on
+    # where that starts. Both value types written here are even width, so the value
+    # blocks stay word aligned without padding. Their sizes depend only on each
+    # entry's type and count, so the layout is identical in both passes.
+    overflow_positions: dict[int, int] = {}
     overflow_size = 0
     for tag, typ, values in entries:
         packed = pack(typ, values)
         if len(packed) > 4:
-            blocks[tag] = overflow_size
+            overflow_positions[tag] = overflow_size
             overflow_size += len(packed)
 
-    tile_offsets = []
+    block_offsets = []
     next_offset = data_offset + overflow_size
     for count in byte_counts:
-        tile_offsets.append(next_offset)
+        block_offsets.append(next_offset)
         next_offset += count
     entries = [
-        (tag, typ, tile_offsets if tag == 324 else values)
+        (tag, typ, block_offsets if tag == offsets_tag else values)
         for tag, typ, values in entries
     ]
 
@@ -186,7 +232,7 @@ def write_lzw_tiff(
     for tag, typ, values in entries:
         packed = pack(typ, values)
         if len(packed) > 4:
-            position = blocks[tag]
+            position = overflow_positions[tag]
             overflow[position : position + len(packed)] = packed
             value_fields[tag] = struct.pack("<I", data_offset + position)
         else:
@@ -198,7 +244,7 @@ def write_lzw_tiff(
         out += struct.pack("<HHI", tag, typ, len(values)) + value_fields[tag]
     out += struct.pack("<I", 0)  # no further IFDs
     out += overflow
-    for data in tiles:
+    for data in blocks:
         out += data
 
     path = Path(path)

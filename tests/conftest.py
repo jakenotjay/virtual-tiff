@@ -158,18 +158,18 @@ def write_lzw_tiff(
     ifd_offset = 8
     data_offset = ifd_offset + 2 + 12 * len(entries) + 4
 
-    # Values wider than an entry's 4-byte value field live after the IFD. Lay
-    # them out first -- each block padded to an even length to keep the next one
-    # word aligned -- because the tile offsets depend on where the tile data
-    # starts, which depends on how much of this there is. Block sizes depend only
-    # on each entry's type and count, so the layout is the same in both passes.
+    # Values wider than an entry's 4-byte value field live after the IFD, and have
+    # to be laid out before the tile data because the tile offsets depend on where
+    # that starts. Both value types written here are even width, so blocks stay
+    # word aligned without padding. Block sizes depend only on each entry's type
+    # and count, so the layout is identical in both passes.
     blocks: dict[int, int] = {}
     overflow_size = 0
     for tag, typ, values in entries:
         packed = pack(typ, values)
         if len(packed) > 4:
             blocks[tag] = overflow_size
-            overflow_size += len(packed) + len(packed) % 2
+            overflow_size += len(packed)
 
     tile_offsets = []
     next_offset = data_offset + overflow_size

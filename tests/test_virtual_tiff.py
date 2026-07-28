@@ -129,14 +129,14 @@ def test_geo_key_attributes_are_not_booleans():
     assert attrs["model_pixel_scale"] == [1.0, 1.0, 0.0]
 
 
-TRAILING_MODES = pytest.mark.parametrize(
+LZW_TILE = (16, 32)  # 4 x 3 non-square tiles over the 64 x 96 test image
+
+
+@pytest.mark.parametrize(
     "trailing,prescan_outcome",
     [(b"\x00\x00", "over-emit"), (b"\xff\xff", "corrupt")],
     ids=["over-emit", "corrupt-prescan"],
 )
-
-
-@TRAILING_MODES
 @pytest.mark.parametrize(
     "samples_per_pixel,planar_configuration,expected_chunks",
     [
@@ -175,19 +175,28 @@ def test_lzw_tile_without_eoi(
     filepath = write_lzw_tiff(
         tmp_path / "no_eoi.tif",
         pixels,
-        tile=(16, 32),  # 4 x 3 non-square tiles, so chunks != shape
+        tile=LZW_TILE,  # tiles smaller than the image, so chunks != shape
         planar_configuration=planar_configuration,
         with_eoi=False,
         trailing=trailing,
     )
 
-    # Whether the pad bytes actually defeat the size pre-scan depends on the block
-    # size, so pin it here: without this the geometry could change and quietly
-    # leave the file readable, with the test still passing and covering nothing.
-    block = pixels[:16, :32] if planar_configuration == 1 else pixels[:16, :32, :1]
-    assert lzw_prescan_outcome(np.ascontiguousarray(block).tobytes(), trailing) == (
-        prescan_outcome
-    )
+    # Whether the pad bytes actually defeat the size pre-scan depends on each
+    # block's byte count, so pin it for every block the file was built from rather
+    # than assume the geometry above still provokes the failure.
+    tile_height, tile_width = LZW_TILE
+    bands = np.atleast_3d(pixels)
+    for band in (
+        [bands]
+        if planar_configuration == 1
+        else np.split(bands, samples_per_pixel, axis=2)
+    ):
+        for y in range(0, bands.shape[0], tile_height):
+            for x in range(0, bands.shape[1], tile_width):
+                payload = np.ascontiguousarray(
+                    band[y : y + tile_height, x : x + tile_width]
+                ).tobytes()
+                assert lzw_prescan_outcome(payload, trailing) == prescan_outcome
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
     ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
@@ -203,27 +212,34 @@ def test_lzw_tile_without_eoi(
 
 
 @pytest.mark.parametrize(
-    "trailing", [b"\x00\x00", b"\xff\xff"], ids=["zero-pad", "ff-pad"]
+    "rows_per_strip,expected_chunks,trailing,prescan_outcome",
+    [
+        (16, (16, 96), b"\x00\x00", "over-emit"),
+        (16, (16, 96), b"\xff\xff", "corrupt"),
+        (1000, (64, 96), b"\x00\x00", "over-emit"),
+        # A single full-height strip runs long enough that the 0xff padding forms a
+        # code the dictionary already holds, so this case over-emits instead of
+        # raising. Which mode a stream lands in follows from its byte count, hence
+        # spelling out the expectation per case rather than per pad byte.
+        (1000, (64, 96), b"\xff\xff", "over-emit"),
+    ],
+    ids=[
+        "strips-zero-pad",
+        "strips-ff-pad",
+        "over-height-zero-pad",
+        "over-height-ff-pad",
+    ],
 )
-@pytest.mark.parametrize(
-    "rows_per_strip,expected_chunks",
-    [(16, (16, 96)), (1000, (64, 96))],
-    ids=["strips", "rows-per-strip-over-height"],
-)
-def test_lzw_strip_without_eoi(tmp_path, rows_per_strip, expected_chunks, trailing):
+def test_lzw_strip_without_eoi(
+    tmp_path, rows_per_strip, expected_chunks, trailing, prescan_outcome
+):
     """The same read for striped files, whose chunk shape comes from RowsPerStrip
     rather than the tile tags.
 
     Striped LZW is what older, hand-rolled writers emit, which are the writers that
-    omit the EOI code in the first place. The second case has RowsPerStrip larger
+    omit the EOI code in the first place. The second geometry has RowsPerStrip larger
     than the image, where a reader has to clamp it to the height to get the chunk
     shape the decode is then sized from.
-
-    Unlike the tiled test this only pins that each stream defeats the size pre-scan,
-    not which way: whether the pad bytes read as a valid phantom code or an
-    out-of-range one falls out of the strip's byte count, and at these sizes both
-    pad bytes happen to over-emit. Both failure modes are covered explicitly by the
-    tiled test.
     """
     rng = np.random.default_rng(0)
     pixels = rng.integers(0, 256, size=(64, 96), dtype=np.uint8)
@@ -235,8 +251,9 @@ def test_lzw_strip_without_eoi(tmp_path, rows_per_strip, expected_chunks, traili
         trailing=trailing,
     )
 
-    strip = pixels[: expected_chunks[0], :]
-    assert lzw_prescan_outcome(strip.tobytes(), trailing) in {"over-emit", "corrupt"}
+    for y in range(0, pixels.shape[0], expected_chunks[0]):
+        strip = pixels[y : y + expected_chunks[0], :]
+        assert lzw_prescan_outcome(strip.tobytes(), trailing) == prescan_outcome
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
     ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)

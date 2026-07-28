@@ -102,12 +102,13 @@ def write_lzw_tiff(
     """Write ``pixels`` as an LZW-compressed TIFF, either tiled or striped.
 
     ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
-    array. Pass at most one of:
+    array. Blocks must divide the image evenly in either layout, since no block may
+    be partial -- which matches the reader, whose default chunk grid rejects a
+    partial final strip. Pass at most one of:
 
     ``tile``
         the ``(height, width)`` of each tile, defaulting to the whole image. TIFF
-        requires both to be multiples of 16, and this helper also requires them to
-        divide the image evenly so that no block is partial.
+        requires both to be multiples of 16.
     ``rows_per_strip``
         write strips of this many full-width rows instead of tiles. Values larger
         than the image height are written to the tag as given but produce a single

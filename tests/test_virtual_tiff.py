@@ -196,8 +196,8 @@ def test_lzw_tile_without_eoi(
     np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
     # ...and the pixels written in the first place, so a decoder that agreed
     # with GDAL on the wrong answer would still be caught
-    written = pixels if pixels.ndim == 2 else np.moveaxis(pixels, -1, 0)
-    np.testing.assert_array_equal(actual.squeeze(), written.squeeze())
+    band_first = pixels if pixels.ndim == 2 else np.moveaxis(pixels, -1, 0)
+    np.testing.assert_array_equal(actual.squeeze(), band_first.squeeze())
 
 
 @pytest.mark.parametrize(

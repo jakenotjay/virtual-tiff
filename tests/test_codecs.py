@@ -31,7 +31,7 @@ from virtual_tiff.parser import (
     _get_compression,
 )
 
-from .conftest import lzw_encode_literals
+from .conftest import lzw_encode_literals, lzw_prescan_outcome
 
 _DEFAULT_CONFIG = ArrayConfig(order="C", write_empty_chunks=True)
 
@@ -612,10 +612,10 @@ class TestLZWWithoutEOI:
         BytesCodec as 'cannot reshape array of size 65538 into shape (256, 256)'.
         """
         original = self._payload(self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
         # Precondition: without the expected size, imagecodecs over-emits.
-        assert len(imagecodecs.lzw_decode(raw)) > self.NBYTES
+        assert lzw_prescan_outcome(original, b"\x00\x00") == "over-emit"
 
+        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
         assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
 
     @pytest.mark.asyncio
@@ -625,11 +625,10 @@ class TestLZWWithoutEOI:
         exists -- which is why truncating after decoding cannot fix these tiles.
         """
         original = self._payload(self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\xff\xff")
         # Precondition: without the expected size, imagecodecs raises.
-        with pytest.raises(imagecodecs.LzwError, match="IMCD_LZW_CORRUPT"):
-            imagecodecs.lzw_decode(raw)
+        assert lzw_prescan_outcome(original, b"\xff\xff") == "corrupt"
 
+        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\xff\xff")
         assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
 
     @pytest.mark.asyncio
@@ -646,8 +645,9 @@ class TestLZWWithoutEOI:
         """The expected size must account for the dtype's item size, not just
         the number of elements."""
         original = self._payload(2 * self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
+        assert lzw_prescan_outcome(original, b"\x00\x00") == "over-emit"
 
+        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
         assert await self._decode(raw, _make_spec(self.SHAPE, UInt16())) == original
 
     @pytest.mark.asyncio

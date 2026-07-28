@@ -121,7 +121,11 @@ def write_lzw_tiff(
     :func:`lzw_encode_literals` for every block, which is how a file with
     non-conformant streams gets built.
     """
-    pixels = np.ascontiguousarray(pixels, dtype=np.uint8)
+    # BitsPerSample and SampleFormat below are hardcoded 8-bit unsigned, so refuse
+    # anything else rather than wrapping the values mod 256 on the way in.
+    if np.asarray(pixels).dtype != np.uint8:
+        raise ValueError(f"pixels must be uint8, got {np.asarray(pixels).dtype}")
+    pixels = np.ascontiguousarray(pixels)
     if pixels.ndim == 2:
         pixels = pixels[:, :, None]
     height, width, samples = pixels.shape

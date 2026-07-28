@@ -242,6 +242,13 @@ class LZWCodec(_ImageCodecsBytesBytesCodec):
         and decodes it as extra codes, so it either over-estimates the size or
         raises ``IMCD_LZW_CORRUPT``. Supplying the size skips that pre-scan
         entirely, which is what tifffile has always done.
+
+        The trade is that capping the output is also what stops a stream that
+        decodes to more than one chunk from being noticed: such a stream is now
+        truncated to the first chunk's worth of bytes instead of raising, so a
+        tile whose recorded byte range is wrong can return plausible pixels. Only
+        short decodes are still detectable. libtiff and tifffile accept the same
+        trade, and it is the cost of not letting the decoder guess.
         """
         nbytes = (
             math.prod(chunk_spec.shape) * chunk_spec.dtype.to_native_dtype().itemsize

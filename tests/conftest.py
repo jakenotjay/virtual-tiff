@@ -74,15 +74,20 @@ def write_lzw_tiff(
     pixels: np.ndarray,
     *,
     tile: tuple[int, int] | None = None,
+    planar_configuration: int = 1,
     with_eoi: bool = True,
     trailing: bytes = b"",
 ) -> str:
-    """Write ``pixels`` as an LZW-compressed, tiled, chunky TIFF.
+    """Write ``pixels`` as an LZW-compressed, tiled TIFF.
 
     ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
     array. ``tile`` is the ``(height, width)`` of each tile, defaulting to the
     whole image; TIFF requires both to be multiples of 16, and this helper also
     requires them to divide the image evenly so that no tile is partial.
+
+    ``planar_configuration`` is 1 for chunky tiles, where each tile interleaves
+    every sample, or 2 for planar tiles, where each tile holds one sample and the
+    tiles are ordered plane by plane.
 
     ``with_eoi`` and ``trailing`` are passed through to
     :func:`lzw_encode_literals` for every tile, which is how a file with
@@ -104,14 +109,25 @@ def write_lzw_tiff(
             f"{(tile_height, tile_width)} tiles"
         )
 
+    if planar_configuration not in (1, 2):
+        raise ValueError(
+            f"PlanarConfiguration must be 1 or 2, got {planar_configuration}"
+        )
+
+    # Chunky files hold one tile per grid position, each interleaving all samples;
+    # planar files hold one tile per sample per grid position, ordered by sample.
+    planes = (
+        [pixels] if planar_configuration == 1 else np.split(pixels, samples, axis=2)
+    )
     tiles = [
         lzw_encode_literals(
             np.ascontiguousarray(
-                pixels[y : y + tile_height, x : x + tile_width]
+                plane[y : y + tile_height, x : x + tile_width]
             ).tobytes(),
             with_eoi=with_eoi,
             trailing=trailing,
         )
+        for plane in planes
         for y in range(0, height, tile_height)
         for x in range(0, width, tile_width)
     ]
@@ -125,7 +141,7 @@ def write_lzw_tiff(
         (259, _TIFF_SHORT, [5]),  # Compression: LZW
         (262, _TIFF_SHORT, [2 if samples >= 3 else 1]),  # RGB / BlackIsZero
         (277, _TIFF_SHORT, [samples]),  # SamplesPerPixel
-        (284, _TIFF_SHORT, [1]),  # PlanarConfiguration: chunky
+        (284, _TIFF_SHORT, [planar_configuration]),  # PlanarConfiguration
         (317, _TIFF_SHORT, [1]),  # Predictor: none
         (322, _TIFF_LONG, [tile_width]),  # TileWidth
         (323, _TIFF_LONG, [tile_height]),  # TileLength

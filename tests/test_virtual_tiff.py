@@ -131,8 +131,18 @@ def test_geo_key_attributes_are_not_booleans():
 @pytest.mark.parametrize(
     "trailing", [b"\x00\x00", b"\xff\xff"], ids=["over-emit", "corrupt-prescan"]
 )
-@pytest.mark.parametrize("samples_per_pixel", [1, 3], ids=["single", "chunky"])
-def test_lzw_tile_without_eoi(tmp_path, samples_per_pixel, trailing):
+@pytest.mark.parametrize(
+    "samples_per_pixel,planar_configuration,expected_chunks",
+    [
+        (1, 1, (32, 32)),
+        (3, 1, (3, 32, 32)),
+        (3, 2, (1, 32, 32)),
+    ],
+    ids=["single", "chunky", "planar"],
+)
+def test_lzw_tile_without_eoi(
+    tmp_path, samples_per_pixel, planar_configuration, expected_chunks, trailing
+):
     """Tiles whose LZW streams omit the mandatory End-Of-Information code read
     correctly end to end, and match what GDAL reads from the same file.
 
@@ -141,11 +151,12 @@ def test_lzw_tile_without_eoi(tmp_path, samples_per_pixel, trailing):
     1026 into shape (32,32)'), and 0xff pad bytes made its size pre-scan raise
     IMCD_LZW_CORRUPT.
 
-    The image is deliberately non-square and larger than one tile, so the size
-    the decode is given has to come from the chunk rather than the array, and the
-    y/x order has to be right. The 3-sample case adds the chunky path, where the
-    sample dimension is part of the chunk and a transpose sits between the
-    compression codec and the array.
+    The image is deliberately non-square and larger than one tile, so the size the
+    decode is given has to come from the chunk rather than the array, and the y/x
+    order has to be right. The three layouts cover every shape that size can be
+    derived from: a bare tile, a chunky tile carrying all samples, and a planar
+    tile carrying one -- the last being where a factor of samples-per-pixel would
+    otherwise go unnoticed.
     """
     rng = np.random.default_rng(0)
     shape = (64, 96) if samples_per_pixel == 1 else (64, 96, samples_per_pixel)
@@ -154,13 +165,14 @@ def test_lzw_tile_without_eoi(tmp_path, samples_per_pixel, trailing):
         tmp_path / "no_eoi.tif",
         pixels,
         tile=(32, 32),  # 2 x 3 tiles, so chunks != shape
+        planar_configuration=planar_configuration,
         with_eoi=False,
         trailing=trailing,
     )
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
     ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
-    assert ds["0"].encoding["chunks"][-2:] == (32, 32)
+    assert ds["0"].encoding["chunks"] == expected_chunks
     actual = ds["0"].data
 
     expected = rioxarray.open_rasterio(filepath, masked=False).data

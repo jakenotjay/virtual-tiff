@@ -133,8 +133,18 @@ def test_source_file_still_exhibits_missing_eoi(raw_tiles, geometry, tile_index)
 
     try:
         unsized = len(imagecodecs.lzw_decode(raw))
-    except imagecodecs.LzwError:
-        pass  # the size pre-scan walked into an undecodable code
+    except imagecodecs.LzwError as exc:
+        # The size pre-scan walked into an undecodable code. Insist on that
+        # specific failure: imagecodecs.LzwError is just ImcdError, so accepting
+        # any of them would let an unrelated failure (a byte range that no longer
+        # lands on a tile, say) pass for evidence of a missing EOI. This is still
+        # inference from a symptom -- proving the absence of an EOI code outright
+        # would mean reimplementing TIFF-LZW's early-change code-width rules here,
+        # which is more machinery than a guard warrants.
+        assert "IMCD_LZW_CORRUPT" in str(exc), (
+            f"tile {tile_index} now fails differently ({exc}); the source file "
+            "may have been rewritten or the tile offsets may have moved"
+        )
     else:
         assert unsized > expected_nbytes, (
             f"tile {tile_index} no longer over-emits ({unsized} bytes); the "

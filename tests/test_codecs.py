@@ -652,10 +652,9 @@ class TestLZWWithoutEOI:
 
     @pytest.mark.asyncio
     async def test_truncated_stream_raises(self):
-        """A stream that genuinely decodes to fewer bytes than the chunk needs is
-        real corruption. It must raise rather than return a partly filled buffer,
-        because the decoder leaves the untouched tail of the output buffer
-        uninitialised."""
+        """A stream that decodes to fewer bytes than the chunk needs is truncated
+        or corrupt, and must raise rather than return a chunk whose tail is
+        zero-filled padding the file never contained."""
         raw = lzw_encode_literals(self._payload(1000), with_eoi=True)
         with pytest.raises(ValueError, match="1000 bytes.*expected 65536"):
             await self._decode(raw, _make_spec(self.SHAPE, UInt8()))

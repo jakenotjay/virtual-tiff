@@ -133,26 +133,34 @@ def test_geo_key_attributes_are_not_booleans():
 )
 @pytest.mark.parametrize("samples_per_pixel", [1, 3], ids=["single", "chunky"])
 def test_lzw_tile_without_eoi(tmp_path, samples_per_pixel, trailing):
-    """A tile whose LZW stream omits the mandatory End-Of-Information code reads
-    correctly end to end, and matches what GDAL reads from the same file.
+    """Tiles whose LZW streams omit the mandatory End-Of-Information code read
+    correctly end to end, and match what GDAL reads from the same file.
 
     Both failure modes used to surface from the read: trailing zero pad bytes made
     imagecodecs over-estimate the decoded size ('cannot reshape array of size
-    4098 into shape (64,64)'), and 0xff pad bytes made its size pre-scan raise
-    IMCD_LZW_CORRUPT. The chunky case matters on top of the codec-level tests in
-    test_codecs.py because the ArraySpec that reaches the compression codec has
-    been through the transpose, so it checks that the pre-sized decode reads the
-    chunk size from a spec whose shape is not the array's own.
+    1026 into shape (32,32)'), and 0xff pad bytes made its size pre-scan raise
+    IMCD_LZW_CORRUPT.
+
+    The image is deliberately non-square and larger than one tile, so the size
+    the decode is given has to come from the chunk rather than the array, and the
+    y/x order has to be right. The 3-sample case adds the chunky path, where the
+    sample dimension is part of the chunk and a transpose sits between the
+    compression codec and the array.
     """
     rng = np.random.default_rng(0)
-    shape = (64, 64) if samples_per_pixel == 1 else (64, 64, samples_per_pixel)
+    shape = (64, 96) if samples_per_pixel == 1 else (64, 96, samples_per_pixel)
     pixels = rng.integers(0, 256, size=shape, dtype=np.uint8)
     filepath = write_lzw_tiff(
-        tmp_path / "no_eoi.tif", pixels, with_eoi=False, trailing=trailing
+        tmp_path / "no_eoi.tif",
+        pixels,
+        tile=(32, 32),  # 2 x 3 tiles, so chunks != shape
+        with_eoi=False,
+        trailing=trailing,
     )
 
     registry = ObjectStoreRegistry({"file://": LocalStore()})
     ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
+    assert ds["0"].encoding["chunks"][-2:] == (32, 32)
     actual = ds["0"].data
 
     expected = rioxarray.open_rasterio(filepath, masked=False).data

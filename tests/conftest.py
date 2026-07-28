@@ -73,24 +73,49 @@ def write_lzw_tiff(
     path: Path | str,
     pixels: np.ndarray,
     *,
+    tile: tuple[int, int] | None = None,
     with_eoi: bool = True,
     trailing: bytes = b"",
 ) -> str:
-    """Write ``pixels`` as an uncompressed-metadata, LZW-compressed, one-tile TIFF.
+    """Write ``pixels`` as an LZW-compressed, tiled, chunky TIFF.
 
     ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
-    array whose height and width are multiples of 16, so the whole image is a
-    single chunky tile. ``with_eoi`` and ``trailing`` are passed through to
-    :func:`lzw_encode_literals`, which is how a file with a non-conformant tile
-    stream gets built.
+    array. ``tile`` is the ``(height, width)`` of each tile, defaulting to the
+    whole image; TIFF requires both to be multiples of 16, and this helper also
+    requires them to divide the image evenly so that no tile is partial.
+
+    ``with_eoi`` and ``trailing`` are passed through to
+    :func:`lzw_encode_literals` for every tile, which is how a file with
+    non-conformant tile streams gets built.
     """
     pixels = np.ascontiguousarray(pixels, dtype=np.uint8)
     if pixels.ndim == 2:
         pixels = pixels[:, :, None]
     height, width, samples = pixels.shape
-    tile_data = lzw_encode_literals(
-        pixels.tobytes(), with_eoi=with_eoi, trailing=trailing
-    )
+    tile_height, tile_width = tile or (height, width)
+    if tile_height % 16 or tile_width % 16:
+        raise ValueError(
+            f"TIFF tile dimensions must be multiples of 16, got "
+            f"{(tile_height, tile_width)}"
+        )
+    if height % tile_height or width % tile_width:
+        raise ValueError(
+            f"image {(height, width)} is not an exact number of "
+            f"{(tile_height, tile_width)} tiles"
+        )
+
+    tiles = [
+        lzw_encode_literals(
+            np.ascontiguousarray(
+                pixels[y : y + tile_height, x : x + tile_width]
+            ).tobytes(),
+            with_eoi=with_eoi,
+            trailing=trailing,
+        )
+        for y in range(0, height, tile_height)
+        for x in range(0, width, tile_width)
+    ]
+    byte_counts = [len(data) for data in tiles]
 
     # Tags must appear in ascending order.
     entries = [
@@ -102,29 +127,54 @@ def write_lzw_tiff(
         (277, _TIFF_SHORT, [samples]),  # SamplesPerPixel
         (284, _TIFF_SHORT, [1]),  # PlanarConfiguration: chunky
         (317, _TIFF_SHORT, [1]),  # Predictor: none
-        (322, _TIFF_LONG, [width]),  # TileWidth
-        (323, _TIFF_LONG, [height]),  # TileLength
-        (324, _TIFF_LONG, [0]),  # TileOffsets, filled in below
-        (325, _TIFF_LONG, [len(tile_data)]),  # TileByteCounts
+        (322, _TIFF_LONG, [tile_width]),  # TileWidth
+        (323, _TIFF_LONG, [tile_height]),  # TileLength
+        (324, _TIFF_LONG, [0] * len(tiles)),  # TileOffsets, resolved below
+        (325, _TIFF_LONG, byte_counts),  # TileByteCounts
         (339, _TIFF_SHORT, [1] * samples),  # SampleFormat: unsigned integer
     ]
+
+    def pack(typ: int, values: list[int]) -> bytes:
+        return struct.pack(
+            f"<{len(values)}{'H' if typ == _TIFF_SHORT else 'I'}", *values
+        )
 
     ifd_offset = 8
     data_offset = ifd_offset + 2 + 12 * len(entries) + 4
 
-    # Values wider than the entry's 4-byte value field live after the IFD.
-    overflow = bytearray()
+    # Values wider than an entry's 4-byte value field live after the IFD. Lay
+    # them out first -- each block padded to an even length to keep the next one
+    # word aligned -- because the tile offsets depend on where the tile data
+    # starts, which depends on how much of this there is. Block sizes depend only
+    # on each entry's type and count, so the layout is the same in both passes.
+    blocks: dict[int, int] = {}
+    overflow_size = 0
+    for tag, typ, values in entries:
+        packed = pack(typ, values)
+        if len(packed) > 4:
+            blocks[tag] = overflow_size
+            overflow_size += len(packed) + len(packed) % 2
+
+    tile_offsets = []
+    next_offset = data_offset + overflow_size
+    for count in byte_counts:
+        tile_offsets.append(next_offset)
+        next_offset += count
+    entries = [
+        (tag, typ, tile_offsets if tag == 324 else values)
+        for tag, typ, values in entries
+    ]
+
+    overflow = bytearray(overflow_size)
     value_fields = {}
     for tag, typ, values in entries:
-        fmt = "H" if typ == _TIFF_SHORT else "I"
-        packed = struct.pack(f"<{len(values)}{fmt}", *values)
-        if len(packed) <= 4:
-            value_fields[tag] = packed.ljust(4, b"\x00")
+        packed = pack(typ, values)
+        if len(packed) > 4:
+            position = blocks[tag]
+            overflow[position : position + len(packed)] = packed
+            value_fields[tag] = struct.pack("<I", data_offset + position)
         else:
-            value_fields[tag] = struct.pack("<I", data_offset + len(overflow))
-            overflow += packed
-    tile_offset = data_offset + len(overflow)
-    value_fields[324] = struct.pack("<I", tile_offset)
+            value_fields[tag] = packed.ljust(4, b"\x00")
 
     out = bytearray(struct.pack("<2sHI", b"II", 42, ifd_offset))
     out += struct.pack("<H", len(entries))
@@ -132,7 +182,8 @@ def write_lzw_tiff(
         out += struct.pack("<HHI", tag, typ, len(values)) + value_fields[tag]
     out += struct.pack("<I", 0)  # no further IFDs
     out += overflow
-    out += tile_data
+    for data in tiles:
+        out += data
 
     path = Path(path)
     path.write_bytes(bytes(out))

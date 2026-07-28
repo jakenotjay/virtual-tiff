@@ -12,6 +12,7 @@ from .conftest import (
     github_examples,
     loadable_dataset,
     resolve_folder,
+    write_lzw_tiff,
 )
 
 failures = {
@@ -125,6 +126,41 @@ def test_geo_key_attributes_are_not_booleans():
     # model_pixel_scale should be a list of floats, not True
     assert isinstance(attrs["model_pixel_scale"], list)
     assert attrs["model_pixel_scale"] == [1.0, 1.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "trailing", [b"\x00\x00", b"\xff\xff"], ids=["over-emit", "corrupt-prescan"]
+)
+@pytest.mark.parametrize("samples_per_pixel", [1, 3], ids=["single", "chunky"])
+def test_lzw_tile_without_eoi(tmp_path, samples_per_pixel, trailing):
+    """A tile whose LZW stream omits the mandatory End-Of-Information code reads
+    correctly end to end, and matches what GDAL reads from the same file.
+
+    Both failure modes used to surface from the read: trailing zero pad bytes made
+    imagecodecs over-estimate the decoded size ('cannot reshape array of size
+    4098 into shape (64,64)'), and 0xff pad bytes made its size pre-scan raise
+    IMCD_LZW_CORRUPT. The chunky case matters on top of the codec-level tests in
+    test_codecs.py because the ArraySpec that reaches the compression codec has
+    been through the transpose, so it checks that the pre-sized decode reads the
+    chunk size from a spec whose shape is not the array's own.
+    """
+    rng = np.random.default_rng(0)
+    shape = (64, 64) if samples_per_pixel == 1 else (64, 64, samples_per_pixel)
+    pixels = rng.integers(0, 256, size=shape, dtype=np.uint8)
+    filepath = write_lzw_tiff(
+        tmp_path / "no_eoi.tif", pixels, with_eoi=False, trailing=trailing
+    )
+
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    ds = loadable_dataset(f"file://{filepath}", registry, mask_and_scale=False)
+    actual = ds["0"].data
+
+    expected = rioxarray.open_rasterio(filepath, masked=False).data
+    np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
+    # ...and the pixels written in the first place, so a decoder that agreed
+    # with GDAL on the wrong answer would still be caught
+    written = pixels if pixels.ndim == 2 else np.moveaxis(pixels, -1, 0)
+    np.testing.assert_array_equal(actual.squeeze(), written.squeeze())
 
 
 def test_local_store_with_prefix():

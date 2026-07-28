@@ -209,16 +209,23 @@ class LZWCodec(_ImageCodecsBytesBytesCodec):
     def _decode_sized(
         self, chunk_bytes: Buffer, prototype: BufferPrototype, nbytes: int
     ) -> Buffer:
-        out = np.empty(nbytes, dtype=np.uint8)
-        # imagecodecs returns a view of only the bytes it actually wrote, so the
-        # return value has to be used rather than the buffer itself.
+        # imagecodecs returns a view of only the bytes it actually wrote and
+        # leaves the rest of the buffer untouched, so the length of the return
+        # value is what tells us whether the whole chunk was decoded. That is
+        # behaviour rather than documented API, hence zeros rather than empty:
+        # if a future release ever returned the full buffer instead, a short
+        # decode would slip through as a zero-filled tail rather than as
+        # whatever happened to be on the heap.
+        out = np.zeros(nbytes, dtype=np.uint8)
         decoded = memoryview(
             self._codec.decode(chunk_bytes.as_numpy_array(), out=out)
         ).cast("B")
         if len(decoded) != nbytes:
             raise ValueError(
                 f"{self.codec_name} decoded {len(decoded)} bytes, expected "
-                f"{nbytes}: the compressed stream is truncated or corrupt"
+                f"{nbytes}: the compressed stream is truncated or corrupt, or "
+                "the TIFF packs samples on sub-byte boundaries, which is not "
+                "supported"
             )
         return prototype.buffer.from_bytes(decoded)
 
@@ -246,6 +253,13 @@ class LZWCodec(_ImageCodecsBytesBytesCodec):
 
 class PackBitsCodec(_ImageCodecsBytesBytesCodec):
     codec_name = "imagecodecs_packbits"
+
+    # PackBits shares LZW's exposure to trailing pad bytes -- a pad byte reads as
+    # another control byte, so the size pre-scan over-estimates -- but the fix
+    # above does not transfer: ``imcd_packbits_decode`` raises
+    # IMCD_OUTPUT_TOO_SMALL when it runs out of output room instead of stopping
+    # like the LZW decoder does, so pre-sizing only swaps one error for another.
+    # Left on the inferred-size path until there is a real file to test against.
 
 
 class PngCodec(_ImageCodecsBytesBytesCodec):

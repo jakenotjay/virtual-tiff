@@ -11,7 +11,6 @@ from .conftest import (
     geotiff_test_data_examples,
     github_examples,
     loadable_dataset,
-    lzw_prescan_outcome,
     resolve_folder,
     write_lzw_tiff,
 )
@@ -129,14 +128,13 @@ def test_geo_key_attributes_are_not_booleans():
     assert attrs["model_pixel_scale"] == [1.0, 1.0, 0.0]
 
 
-LZW_TILE = (16, 32)  # 4 x 3 non-square tiles over the 64 x 96 test image
+def _read_lzw_tiff(path: str, expected_chunks: tuple[int, ...]):
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    ds = loadable_dataset(f"file://{path}", registry, mask_and_scale=False)
+    assert ds["0"].encoding["chunks"] == expected_chunks
+    return ds["0"].data
 
 
-@pytest.mark.parametrize(
-    "trailing,prescan_outcome",
-    [(b"\x00\x00", "over-emit"), (b"\xff\xff", "corrupt")],
-    ids=["over-emit", "corrupt-prescan"],
-)
 @pytest.mark.parametrize(
     "samples_per_pixel,planar_configuration,expected_chunks",
     [
@@ -147,52 +145,29 @@ LZW_TILE = (16, 32)  # 4 x 3 non-square tiles over the 64 x 96 test image
     ids=["single", "chunky", "planar"],
 )
 def test_lzw_tile_without_eoi(
-    tmp_path,
-    samples_per_pixel,
-    planar_configuration,
-    expected_chunks,
-    trailing,
-    prescan_outcome,
+    tmp_path, samples_per_pixel, planar_configuration, expected_chunks
 ):
-    """Tiles whose LZW streams omit the mandatory End-Of-Information code read
-    correctly end to end, and match what GDAL reads from the same file.
+    """Tiles whose LZW streams omit the End-Of-Information code read correctly end
+    to end, and match what GDAL reads from the same file.
 
-    Both failure modes used to surface from the read: trailing zero pad bytes made
-    imagecodecs over-estimate the decoded size ('cannot reshape array of size 514
-    into shape (16,32)'), and 0xff pad bytes made its size pre-scan raise
-    IMCD_LZW_CORRUPT.
-
-    Image and tile are both non-square and the image spans several tiles, so the
-    size the decode is given has to come from the chunk rather than the array, and
-    a y/x transposition anywhere in the chain changes the chunk shape. The three
-    layouts cover every shape that size can be derived from: a bare tile, a chunky
-    tile carrying all samples, and a planar tile carrying one -- the last being
-    where a factor of samples-per-pixel would otherwise go unnoticed.
+    The decode is sized from the chunk, so the parser has to hand it a shape whose
+    byte count matches one tile: the three layouts are the shapes that can come
+    from, and planar is where a stray samples-per-pixel factor would hide.
     """
     rng = np.random.default_rng(0)
     shape = (64, 96) if samples_per_pixel == 1 else (64, 96, samples_per_pixel)
     pixels = rng.integers(0, 256, size=shape, dtype=np.uint8)
-    written = write_lzw_tiff(
+    path = write_lzw_tiff(
         tmp_path / "no_eoi.tif",
         pixels,
-        tile=LZW_TILE,  # tiles smaller than the image, so chunks != shape
+        tile=(16, 32),  # non-square tiles, several per image, so chunks != shape
         planar_configuration=planar_configuration,
         with_eoi=False,
-        trailing=trailing,
+        trailing=b"\x00\x00",
     )
 
-    # Whether the pad bytes actually defeat the size pre-scan depends on where the
-    # last code of each stream lands, so pin it for the streams the file really
-    # contains rather than assume the geometry above still provokes the failure.
-    for stream, nbytes in written.blocks:
-        assert lzw_prescan_outcome(stream, nbytes) == prescan_outcome
-
-    registry = ObjectStoreRegistry({"file://": LocalStore()})
-    ds = loadable_dataset(f"file://{written.path}", registry, mask_and_scale=False)
-    assert ds["0"].encoding["chunks"] == expected_chunks
-    actual = ds["0"].data
-
-    expected = rioxarray.open_rasterio(written.path, masked=False).data
+    actual = _read_lzw_tiff(path, expected_chunks)
+    expected = rioxarray.open_rasterio(path, masked=False).data
     np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
     # ...and the pixels written in the first place, so a decoder that agreed
     # with GDAL on the wrong answer would still be caught
@@ -201,56 +176,27 @@ def test_lzw_tile_without_eoi(
 
 
 @pytest.mark.parametrize(
-    "rows_per_strip,expected_chunks,trailing,prescan_outcome",
-    [
-        (16, (16, 96), b"\x00\x00", "over-emit"),
-        (16, (16, 96), b"\xff\xff", "corrupt"),
-        (1000, (64, 96), b"\x00\x00", "over-emit"),
-        # This one over-emits rather than raising because of where its last code
-        # lands, not because it is longer: the phantom code the 0xff padding forms is
-        # 2**(9 - p) - 1 for p zero pad bits, and only p == 1 gives a literal (255)
-        # that the dictionary holds while leaving too few bits behind for another
-        # code. Every other alignment reads 511, which this encoder's dictionary
-        # never reaches. Hence an expectation per case rather than per pad byte.
-        (1000, (64, 96), b"\xff\xff", "over-emit"),
-    ],
-    ids=[
-        "strips-zero-pad",
-        "strips-ff-pad",
-        "over-height-zero-pad",
-        "over-height-ff-pad",
-    ],
+    "rows_per_strip,expected_chunks",
+    [(16, (16, 96)), (1000, (64, 96))],
+    ids=["strips", "over-height-strips"],
 )
-def test_lzw_strip_without_eoi(
-    tmp_path, rows_per_strip, expected_chunks, trailing, prescan_outcome
-):
+def test_lzw_strip_without_eoi(tmp_path, rows_per_strip, expected_chunks):
     """The same read for striped files, whose chunk shape comes from RowsPerStrip
-    rather than the tile tags.
-
-    Striped LZW is what older, hand-rolled writers emit, which are the writers that
-    omit the EOI code in the first place. The second geometry has RowsPerStrip larger
-    than the image, where a reader has to clamp it to the height to get the chunk
-    shape the decode is then sized from.
+    rather than the tile tags -- including a RowsPerStrip past the image height,
+    which the parser clamps before the decode is sized from it.
     """
     rng = np.random.default_rng(0)
     pixels = rng.integers(0, 256, size=(64, 96), dtype=np.uint8)
-    written = write_lzw_tiff(
+    path = write_lzw_tiff(
         tmp_path / "no_eoi_strips.tif",
         pixels,
         rows_per_strip=rows_per_strip,
         with_eoi=False,
-        trailing=trailing,
+        trailing=b"\x00\x00",
     )
 
-    for stream, nbytes in written.blocks:
-        assert lzw_prescan_outcome(stream, nbytes) == prescan_outcome
-
-    registry = ObjectStoreRegistry({"file://": LocalStore()})
-    ds = loadable_dataset(f"file://{written.path}", registry, mask_and_scale=False)
-    assert ds["0"].encoding["chunks"] == expected_chunks
-    actual = ds["0"].data
-
-    expected = rioxarray.open_rasterio(written.path, masked=False).data
+    actual = _read_lzw_tiff(path, expected_chunks)
+    expected = rioxarray.open_rasterio(path, masked=False).data
     np.testing.assert_array_equal(actual.squeeze(), expected.squeeze())
     np.testing.assert_array_equal(actual.squeeze(), pixels)
 

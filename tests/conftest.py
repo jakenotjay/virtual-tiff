@@ -1,6 +1,5 @@
 import struct
 from pathlib import Path
-from typing import NamedTuple
 from urllib.parse import urlparse
 
 import imagecodecs
@@ -22,25 +21,7 @@ LZW_EOI_CODE = 257
 def lzw_encode_literals(
     data: bytes, *, with_eoi: bool = True, trailing: bytes = b""
 ) -> bytes:
-    """Encode ``data`` as a TIFF-LZW stream built only from 9-bit literal codes.
-
-    Each byte is emitted as its own literal code, with a ClearCode every 200
-    codes so the decoder's dictionary never reaches 511 entries and the code
-    width therefore stays at 9 bits for the whole stream. That keeps this helper
-    clear of the TIFF "early change" code-width subtleties while still producing
-    a stream that any conformant LZW decoder accepts.
-
-    Parameters
-    ----------
-    with_eoi
-        Whether to terminate the stream with the mandatory End-Of-Information
-        code. TIFF 6.0 requires it, but writers in the wild sometimes omit it.
-    trailing
-        Extra bytes appended after the code stream, as emitted by writers that
-        pad tile data. Together with a missing EOI these leave enough bits for a
-        decoder's size pre-scan to read a phantom code: zero bytes make it
-        over-estimate the decoded size, ``0xff`` bytes make it fail outright.
-    """
+    """Encode ``data`` as a TIFF-LZW stream of 9-bit literal codes."""
     out = bytearray()
     acc = nbits = 0
 
@@ -68,37 +49,15 @@ def lzw_encode_literals(
     return bytes(out) + trailing
 
 
-def lzw_prescan_outcome(stream: bytes, expected_nbytes: int) -> str:
-    """What imagecodecs' size pre-scan does with ``stream`` when not told the size.
-
-    Returns ``"over-emit"`` when the pre-scan over-estimates the decoded size,
-    ``"corrupt"`` when it walks into an undecodable code, ``"error"`` for any other
-    imcd failure, and ``"clean"`` when the pathology does not reproduce at all --
-    which it does not for every combination of stream length and pad bytes, since
-    whether the padding forms a readable code depends on where the last real code
-    landed. Tests that mean to exercise a particular failure mode should assert on
-    this rather than assume it.
-    """
+def lzw_unsized_decode_fails(stream: bytes, nbytes: int) -> bool:
+    """Whether imagecodecs mis-decodes ``stream`` when not told the output size."""
     try:
-        decoded = imagecodecs.lzw_decode(stream)
-    except imagecodecs.LzwError as exc:
-        return "corrupt" if "IMCD_LZW_CORRUPT" in str(exc) else "error"
-    return "over-emit" if len(decoded) > expected_nbytes else "clean"
+        return len(imagecodecs.lzw_decode(stream)) != nbytes
+    except imagecodecs.LzwError:
+        return True
 
 
 _TIFF_SHORT, _TIFF_LONG = 3, 4
-
-
-class LZWTiff(NamedTuple):
-    """A TIFF written by :func:`write_lzw_tiff`.
-
-    ``blocks`` carries every compressed stream the file contains, in file order,
-    paired with the number of bytes it decodes to -- so a test can assert on the
-    exact bytes that were written rather than re-deriving the block geometry.
-    """
-
-    path: str
-    blocks: tuple[tuple[bytes, int], ...]
 
 
 def write_lzw_tiff(
@@ -110,30 +69,9 @@ def write_lzw_tiff(
     planar_configuration: int = 1,
     with_eoi: bool = True,
     trailing: bytes = b"",
-) -> LZWTiff:
-    """Write ``pixels`` as an LZW-compressed TIFF, either tiled or striped.
-
-    ``pixels`` is a ``(height, width)`` or ``(height, width, samples)`` uint8
-    array. Blocks must divide the image evenly in either layout, so that none is
-    partial: the reader rejects a partial final strip outright, and for tiles this
-    helper simply declines to write the padding a partial tile would need. Pass at
-    most one of:
-
-    ``tile``
-        the ``(height, width)`` of each tile, defaulting to the whole image. TIFF
-        requires both to be multiples of 16.
-    ``rows_per_strip``
-        write strips of this many full-width rows instead of tiles. Values larger
-        than the image height are written to the tag as given but produce a single
-        strip covering every row, which is the case readers have to clamp.
-
-    ``planar_configuration`` is 1 for chunky blocks, where each block interleaves
-    every sample, or 2 for planar blocks, where each block holds one sample and the
-    blocks are ordered plane by plane.
-
-    ``with_eoi`` and ``trailing`` are passed through to
-    :func:`lzw_encode_literals` for every block, which is how a file with
-    non-conformant streams gets built.
+) -> str:
+    """Write uint8 ``pixels``, ``(h, w)`` or ``(h, w, samples)``, as an
+    LZW-compressed TIFF and return its path.
     """
     # BitsPerSample and SampleFormat below are hardcoded 8-bit unsigned, so refuse
     # anything else rather than wrapping the values mod 256 on the way in.
@@ -170,15 +108,17 @@ def write_lzw_tiff(
     planes = (
         [pixels] if planar_configuration == 1 else np.split(pixels, samples, axis=2)
     )
-    payloads = [
-        np.ascontiguousarray(plane[y : y + block_height, x : x + block_width]).tobytes()
+    blocks = [
+        lzw_encode_literals(
+            np.ascontiguousarray(
+                plane[y : y + block_height, x : x + block_width]
+            ).tobytes(),
+            with_eoi=with_eoi,
+            trailing=trailing,
+        )
         for plane in planes
         for y in range(0, height, block_height)
         for x in range(0, width, block_width)
-    ]
-    blocks = [
-        lzw_encode_literals(payload, with_eoi=with_eoi, trailing=trailing)
-        for payload in payloads
     ]
     byte_counts = [len(data) for data in blocks]
 
@@ -265,10 +205,7 @@ def write_lzw_tiff(
 
     path = Path(path)
     path.write_bytes(bytes(out))
-    return LZWTiff(
-        path=str(path),
-        blocks=tuple(zip(blocks, (len(payload) for payload in payloads), strict=True)),
-    )
+    return str(path)
 
 
 # Pytest configuration

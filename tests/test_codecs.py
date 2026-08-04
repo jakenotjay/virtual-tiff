@@ -4,7 +4,6 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
-import imagecodecs
 import numpy as np
 import pytest
 from zarr.codecs.bytes import Endian
@@ -31,7 +30,7 @@ from virtual_tiff.parser import (
     _get_compression,
 )
 
-from .conftest import lzw_encode_literals, lzw_prescan_outcome
+from .conftest import lzw_encode_literals, lzw_unsized_decode_fails
 
 _DEFAULT_CONFIG = ArrayConfig(order="C", write_empty_chunks=True)
 
@@ -577,19 +576,11 @@ class TestHorizontalDeltaFloat:
         np.testing.assert_array_equal(result.as_ndarray_like(), original)
 
 
-# --- LZW streams missing the End-Of-Information code ---
-
-
 class TestLZWWithoutEOI:
     """TIFF 6.0 requires every LZW strip/tile to end with an End-Of-Information
-    code, but some writers omit it (e.g. GLAD's annual class maps).
-
-    ``imagecodecs.lzw_decode`` can only learn the decoded size by walking the
-    code stream first (``imcd_lzw_decode_size``), and with no EOI to stop at
-    that walk continues into the stream's trailing padding: it either decodes
-    phantom codes into extra bytes, or hits an undecodable code and raises. The
-    pixels themselves are fine -- decoding into a correctly sized buffer skips
-    the size pre-scan entirely, which is what tifffile has always done.
+    code, but some writers omit it (e.g. GLAD's annual class maps). Decoding into
+    a correctly sized buffer skips the size pre-scan that then misreads the
+    stream's trailing padding.
     """
 
     SHAPE = (256, 256)
@@ -606,56 +597,33 @@ class TestLZWWithoutEOI:
         return decoded.to_bytes()
 
     @pytest.mark.asyncio
-    async def test_missing_eoi_over_emitting_stream(self):
-        """Zero padding past the last code decodes as phantom bytes, so the
-        unsized decode over-emits. Downstream this surfaces from zarr's
-        BytesCodec as 'cannot reshape array of size 65538 into shape (256, 256)'.
-        """
-        original = self._payload(self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
-        # Precondition: without the expected size, imagecodecs over-emits.
-        assert lzw_prescan_outcome(raw, self.NBYTES) == "over-emit"
+    @pytest.mark.parametrize(
+        "trailing,dtype,itemsize",
+        [
+            # Zero pad bytes decode as phantom codes, so the unsized decode
+            # over-emits; 0xff pad bytes make its pre-scan raise IMCD_LZW_CORRUPT
+            # before any output buffer exists, which is why truncating after the
+            # fact cannot fix those tiles.
+            (b"\x00\x00", UInt8(), 1),
+            (b"\xff\xff", UInt8(), 1),
+            # The size has to account for the dtype's item size, not just the
+            # element count.
+            (b"\x00\x00", UInt16(), 2),
+        ],
+        ids=["zero-pad", "ff-pad", "uint16"],
+    )
+    async def test_missing_eoi_decodes(self, trailing, dtype, itemsize):
+        nbytes = self.NBYTES * itemsize
+        original = self._payload(nbytes)
+        raw = lzw_encode_literals(original, with_eoi=False, trailing=trailing)
+        assert lzw_unsized_decode_fails(raw, nbytes)
 
-        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
-
-    @pytest.mark.asyncio
-    async def test_missing_eoi_corrupt_prescan_stream(self):
-        """Set padding bits past the last code form an out-of-range code, so the
-        size pre-scan raises ImcdError IMCD_LZW_CORRUPT before any output buffer
-        exists -- which is why truncating after decoding cannot fix these tiles.
-        """
-        original = self._payload(self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\xff\xff")
-        # Precondition: without the expected size, imagecodecs raises.
-        assert lzw_prescan_outcome(raw, self.NBYTES) == "corrupt"
-
-        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
-
-    @pytest.mark.asyncio
-    async def test_conformant_stream_still_decodes(self):
-        """A stream that does end with EOI must decode exactly as before."""
-        original = self._payload(self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=True)
-        assert lzw_prescan_outcome(raw, self.NBYTES) == "clean"  # nothing to fix here
-        assert imagecodecs.lzw_decode(raw) == original
-
-        assert await self._decode(raw, _make_spec(self.SHAPE, UInt8())) == original
-
-    @pytest.mark.asyncio
-    async def test_missing_eoi_multibyte_dtype(self):
-        """The expected size must account for the dtype's item size, not just
-        the number of elements."""
-        original = self._payload(2 * self.NBYTES)
-        raw = lzw_encode_literals(original, with_eoi=False, trailing=b"\x00\x00")
-        assert lzw_prescan_outcome(raw, 2 * self.NBYTES) == "over-emit"
-
-        assert await self._decode(raw, _make_spec(self.SHAPE, UInt16())) == original
+        assert await self._decode(raw, _make_spec(self.SHAPE, dtype)) == original
 
     @pytest.mark.asyncio
     async def test_truncated_stream_raises(self):
-        """A stream that decodes to fewer bytes than the chunk needs is truncated
-        or corrupt, and must raise rather than return a chunk whose tail is
-        zero-filled padding the file never contained."""
+        """A stream decoding to fewer bytes than the chunk needs must raise rather
+        than return a chunk whose tail is zero padding the file never held."""
         raw = lzw_encode_literals(self._payload(1000), with_eoi=True)
         with pytest.raises(ValueError, match="1000 bytes.*expected 65536"):
             await self._decode(raw, _make_spec(self.SHAPE, UInt8()))

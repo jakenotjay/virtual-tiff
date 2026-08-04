@@ -206,67 +206,39 @@ class LercCodec(_ImageCodecsBytesBytesCodec):
 class LZWCodec(_ImageCodecsBytesBytesCodec):
     codec_name = "imagecodecs_lzw"
 
-    def _decode_sized(
+    def _decode(
         self, chunk_bytes: Buffer, prototype: BufferPrototype, nbytes: int
     ) -> Buffer:
-        # imagecodecs returns a view of only the bytes it actually wrote and
-        # leaves the rest of the buffer untouched, so the length of the return
-        # value is what tells us whether the whole chunk was decoded. That is
-        # behaviour rather than documented API, hence zeros rather than empty:
-        # if a future release ever returned the full buffer instead, a short
-        # decode would slip through as a zero-filled tail rather than as
-        # whatever happened to be on the heap.
+        # imagecodecs returns a view of only the bytes it wrote, so a short
+        # result is the only signal that the stream didn't fill the chunk.
         out = np.zeros(nbytes, dtype=np.uint8)
-        decoded = memoryview(
-            self._codec.decode(chunk_bytes.as_numpy_array(), out=out)
-        ).cast("B")
+        decoded = memoryview(self._codec.decode(chunk_bytes.as_numpy_array(), out=out))
         if len(decoded) != nbytes:
             raise ValueError(
-                f"{self.codec_name} decoded {len(decoded)} bytes, expected "
-                f"{nbytes}: the compressed stream is truncated or corrupt, or "
-                "the TIFF packs samples on sub-byte boundaries, which is not "
-                "supported"
+                f"{self.codec_name} decoded {len(decoded)} bytes, expected {nbytes}: "
+                "the compressed stream is truncated or corrupt."
             )
         return prototype.buffer.from_bytes(decoded)
 
     async def _decode_single(
         self, chunk_bytes: Buffer, chunk_spec: ArraySpec
     ) -> Buffer:
-        """Decode into a pre-sized buffer rather than letting imagecodecs infer
-        the decoded size.
-
-        TIFF requires every LZW strip or tile to end with an End-Of-Information
-        code, but some writers omit it. With no EOI to stop at, the size
-        pre-scan (``imcd_lzw_decode_size``) that imagecodecs runs when it is not
-        told the output size keeps walking into the stream's trailing padding
-        and decodes it as extra codes, so it either over-estimates the size or
-        raises ``IMCD_LZW_CORRUPT``. Supplying the size skips that pre-scan
-        entirely, which is what tifffile has always done.
-
-        The trade is that capping the output is also what stops a stream that
-        decodes to more than one chunk from being noticed: such a stream is now
-        truncated to the first chunk's worth of bytes instead of raising, so a
-        tile whose recorded byte range is wrong can return plausible pixels. Only
-        short decodes are still detectable. libtiff and tifffile accept the same
-        trade, and it is the cost of not letting the decoder guess.
-        """
+        # TIFF requires every LZW strip/tile to end in an End-Of-Information
+        # code, but some writers omit it. Without one, the size pre-scan
+        # imagecodecs runs when it isn't given an output size decodes the
+        # trailing padding as extra codes and either over-estimates or raises
+        # IMCD_LZW_CORRUPT. Passing the size skips the pre-scan, as tifffile
+        # does; the cost is that an over-long stream is silently truncated.
         nbytes = (
             math.prod(chunk_spec.shape) * chunk_spec.dtype.to_native_dtype().itemsize
         )
         return await asyncio.to_thread(
-            self._decode_sized, chunk_bytes, chunk_spec.prototype, nbytes
+            self._decode, chunk_bytes, chunk_spec.prototype, nbytes
         )
 
 
 class PackBitsCodec(_ImageCodecsBytesBytesCodec):
     codec_name = "imagecodecs_packbits"
-
-    # PackBits shares LZW's exposure to trailing pad bytes -- a pad byte reads as
-    # another control byte, so the size pre-scan over-estimates -- but the fix
-    # above does not transfer: ``imcd_packbits_decode`` raises
-    # IMCD_OUTPUT_TOO_SMALL when it runs out of output room instead of stopping
-    # like the LZW decoder does, so pre-sizing only swaps one error for another.
-    # Left on the inferred-size path until there is a real file to test against.
 
 
 class PngCodec(_ImageCodecsBytesBytesCodec):
